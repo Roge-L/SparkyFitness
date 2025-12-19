@@ -2,7 +2,7 @@ app = 'sparkyfitness'
 primary_region = 'iad'
 
 [build]
-  image = "codewithcj/sparkyfitness:latest"
+  dockerfile = "Dockerfile"
 
 [env]
   SPARKY_FITNESS_SERVER_HOST = "sparkyfitness-server.flycast"

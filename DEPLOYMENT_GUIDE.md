@@ -8,7 +8,8 @@ A guide explaining how we deployed SparkyFitness to Fly.io, covering Docker, net
 3. [Fly.io Concepts](#flyio-concepts)
 4. [The Deployment Process](#the-deployment-process)
 5. [Networking Deep Dive](#networking-deep-dive)
-6. [Configuration Files Explained](#configuration-files-explained)
+6. [Configuration Files](#configuration-files)
+7. [Updating Your Deployment](#updating-your-deployment)
 
 ---
 
@@ -36,29 +37,31 @@ SparkyFitness has three components:
 
 Docker packages applications into **containers** - lightweight, standalone units that include everything needed to run: code, runtime, libraries, and settings.
 
+Think of it like shipping containers for software. Just like how shipping containers standardized global trade (any container fits on any ship/truck/train), Docker containers standardize software deployment (any container runs on any Docker host).
+
 **Key concepts:**
-- **Image**: A read-only template (like a snapshot of an app)
-- **Container**: A running instance of an image
-- **Registry**: A place to store/share images (like DockerHub)
+- **Image**: A read-only template (like a snapshot of an app). Built from a Dockerfile.
+- **Container**: A running instance of an image. You can have multiple containers from the same image.
+- **Registry**: A place to store/share images (like DockerHub, or Fly.io's registry)
+- **Dockerfile**: Instructions to build an image from source code
 
-**Docs**: https://docs.docker.com/get-started/
+### Pre-built Images vs Building from Source
 
-### How SparkyFitness Uses Docker
-
-SparkyFitness publishes pre-built images to DockerHub:
-- `codewithcj/sparkyfitness:latest` - Frontend
-- `codewithcj/sparkyfitness_server:latest` - Backend
-
-Instead of building from source, Fly.io pulls these images directly:
-
+**Option 1: Pre-built Images**
 ```toml
 [build]
   image = "codewithcj/sparkyfitness_server:latest"
 ```
+Fly.io pulls the image directly from DockerHub. Fast, but you get whatever version was last published.
 
-This is faster than building and ensures consistency.
+**Option 2: Build from Source (what we use)**
+```toml
+[build]
+  dockerfile = "Dockerfile"
+```
+Fly.io (or your local Docker) builds the image from your source code. Slower, but you get the exact code you have locally.
 
-**Docs**: https://fly.io/docs/languages-and-frameworks/dockerfile/
+**Why we build from source**: The pre-built DockerHub images can be outdated. For example, USDA food provider support was added to the codebase on Dec 16, 2025, but wasn't in the pre-built images yet. Building from source ensures you get the latest features.
 
 ---
 
@@ -66,22 +69,20 @@ This is faster than building and ensures consistency.
 
 ### What is Fly.io?
 
-Fly.io runs your Docker containers on servers worldwide. It's simpler than AWS/GCP but more powerful than Heroku.
+Fly.io runs your Docker containers on servers worldwide. It's simpler than AWS/GCP but more powerful than Heroku. You describe what you want in a `fly.toml` file, and Fly.io handles the rest.
 
 **Key concepts:**
 
 | Concept | What it is |
 |---------|-----------|
-| **App** | A deployed application (has a unique name) |
-| **Machine** | A micro-VM running your container |
-| **Region** | Physical location (e.g., `iad` = Virginia) |
-| **Fly Proxy** | Load balancer that routes traffic to your machines |
-
-**Docs**: https://fly.io/docs/apps/overview/
+| **App** | A deployed application (has a unique name like `sparkyfitness`) |
+| **Machine** | A micro-VM running your container (like a tiny dedicated server) |
+| **Region** | Physical datacenter location (e.g., `iad` = Ashburn, Virginia) |
+| **Fly Proxy** | Load balancer that sits in front of your machines, handles TLS, routes traffic |
 
 ### Machines and Auto-scaling
 
-Fly.io can automatically start/stop machines based on traffic:
+Fly.io can automatically start/stop machines based on traffic to save money:
 
 ```toml
 [http_service]
@@ -90,14 +91,14 @@ Fly.io can automatically start/stop machines based on traffic:
   min_machines_running = 0       # Allow all machines to stop
 ```
 
-For the backend, we disabled auto-stop because internal traffic doesn't trigger auto-start:
+**The catch**: Auto-start only works for traffic coming through the Fly Proxy (public requests). Internal traffic between your apps doesn't trigger auto-start.
+
+For the backend, we disabled auto-stop because the frontend makes internal requests to it:
 
 ```toml
   auto_stop_machines = 'off'
   min_machines_running = 1       # Always keep 1 running
 ```
-
-**Docs**: https://fly.io/docs/launch/autostop-autostart/
 
 ---
 
@@ -109,9 +110,7 @@ For the backend, we disabled auto-stop because internal traffic doesn't trigger 
 flyctl postgres create --name sparkyfitness-db --region iad
 ```
 
-This creates a managed Postgres cluster. Fly.io handles backups, failover, etc.
-
-**Docs**: https://fly.io/docs/postgres/
+This creates a managed Postgres cluster. Fly.io handles backups, failover, connection pooling, etc. You get a database without managing database servers.
 
 ### Step 2: Create the Apps
 
@@ -120,56 +119,69 @@ flyctl apps create sparkyfitness-server --org personal
 flyctl apps create sparkyfitness --org personal
 ```
 
+This reserves the app names and creates the apps in Fly.io's system, but doesn't deploy anything yet.
+
 ### Step 3: Attach Database to Backend
 
 ```bash
 flyctl postgres attach sparkyfitness-db --app sparkyfitness-server
 ```
 
-This:
-1. Creates a database user
-2. Sets `DATABASE_URL` secret on the app
-3. Configures network access
+This does three things:
+1. Creates a database user for the app
+2. Sets the `DATABASE_URL` secret on the app (connection string)
+3. Configures network access so the app can reach the database
 
-### Step 4: Set Secrets
+### Step 4: Allocate Private IP for Flycast
 
-Secrets are encrypted environment variables:
+```bash
+flyctl ips allocate-v6 --private --app sparkyfitness-server
+```
+
+This enables Flycast networking, which we need for frontend→backend communication. More on this in [Networking Deep Dive](#networking-deep-dive).
+
+### Step 5: Set Secrets
+
+Secrets are encrypted environment variables that aren't stored in your code:
 
 ```bash
 flyctl secrets set \
-  SESSION_SECRET="..." \
-  JWT_SECRET="..." \
+  SESSION_SECRET="your-random-string" \
+  JWT_SECRET="another-random-string" \
   --app sparkyfitness-server
 ```
 
-**Important**: Never put secrets in `fly.toml` - that file is committed to git!
+**Important**: Never put secrets in `fly.toml` - that file is committed to git! Use `flyctl secrets set` for anything sensitive.
 
-**Docs**: https://fly.io/docs/reference/secrets/
-
-### Step 5: Deploy
+### Step 6: Deploy
 
 ```bash
-flyctl deploy --ha=false
+# Deploy backend
+cd SparkyFitnessServer
+flyctl deploy --ha=false --local-only
+
+# Deploy frontend
+cd ../SparkyFitnessFrontend
+flyctl deploy --ha=false --local-only
 ```
 
-- `--ha=false` creates only 1 machine (default is 2 for high availability)
-- Fly.io pulls the Docker image and starts the container
+**Flags explained:**
+- `--ha=false`: Creates only 1 machine. Default is 2 for high availability, but that costs more.
+- `--local-only`: Builds the Docker image on your machine instead of Fly.io's remote builders. More reliable, avoids registry authentication issues.
 
 ---
 
 ## Networking Deep Dive
 
-This was the trickiest part. Understanding Fly.io networking is crucial.
+This was the trickiest part of the deployment. Understanding Fly.io networking is crucial.
 
 ### Three Types of Hostnames
 
 | Hostname | Example | Routes Through | Use Case |
 |----------|---------|----------------|----------|
-| `.fly.dev` | `sparkyfitness-server.fly.dev` | Public internet | External access |
+| `.fly.dev` | `sparkyfitness-server.fly.dev` | Public internet | External access from users |
 | `.internal` | `sparkyfitness-server.internal` | Direct to machine | Same-org private traffic |
 | `.flycast` | `sparkyfitness-server.flycast` | Fly Proxy (private) | Private load-balanced traffic |
-
-**Docs**: https://fly.io/docs/networking/private-networking/
 
 ### Why We Used Flycast
 
@@ -180,20 +192,18 @@ User → Frontend (nginx) → Backend
 ```
 
 **Problem with `.internal`**:
-- Nginx validates DNS at startup
-- `.internal` DNS wasn't available during nginx config validation
+- Nginx validates all DNS hostnames when it starts up
+- The `.internal` DNS wasn't resolving during nginx config validation
 - nginx failed to start with "host not found in upstream"
 
 **Solution - Flycast**:
 - Allocate a private IPv6 address: `flyctl ips allocate-v6 --private`
-- Use `.flycast` hostname which resolves immediately
-- Traffic still stays private (never leaves Fly.io network)
+- Use `.flycast` hostname which resolves immediately via Fly's DNS
+- Traffic still stays private (never leaves Fly.io's network)
 
-**Docs**: https://fly.io/docs/networking/flycast/
+### The Port 80 vs 3010 Gotcha
 
-### The Port 80 vs 3010 Issue
-
-**How Fly Proxy works:**
+This one was confusing. Here's how Fly Proxy works:
 
 ```
                     ┌─────────────────┐
@@ -203,11 +213,11 @@ Internet (:443) ──► │   Fly Proxy     │ ──► Container (:3010)
 ```
 
 The Fly Proxy:
-1. Listens on ports 80/443
-2. Handles TLS termination
-3. Forwards to your `internal_port`
+1. Listens on ports 80/443 (standard HTTP/HTTPS)
+2. Terminates TLS (handles the HTTPS encryption)
+3. Forwards plain HTTP to your container's `internal_port`
 
-**Flycast uses the same proxy**, so it listens on port 80, not your internal port!
+**Key insight**: Flycast also routes through the Fly Proxy! So when the frontend connects to `sparkyfitness-server.flycast`, it needs to use port 80 (what the proxy listens on), not port 3010 (what the container listens on).
 
 ```toml
 # Wrong - Flycast doesn't expose port 3010
@@ -217,7 +227,7 @@ SPARKY_FITNESS_SERVER_PORT = "3010"
 SPARKY_FITNESS_SERVER_PORT = "80"
 ```
 
-### force_https Setting
+### The force_https Setting
 
 ```toml
 force_https = true   # Redirects HTTP → HTTPS
@@ -228,49 +238,47 @@ We set `force_https = false` on the backend because:
 - Internal Flycast traffic uses HTTP (TLS is unnecessary inside the private network)
 - With `force_https = true`, the proxy returned 301 redirects that broke internal routing
 
-**Docs**: https://fly.io/docs/networking/services/#force_https
+The frontend keeps `force_https = true` because users should always use HTTPS.
 
 ---
 
-## Configuration Files Explained
+## Configuration Files
 
 ### fly.toml (Backend)
 
 ```toml
-app = 'sparkyfitness-server'       # Unique app name
-primary_region = 'iad'             # Deploy to Virginia
+app = 'sparkyfitness-server'
+primary_region = 'iad'
 
 [build]
-  image = "codewithcj/sparkyfitness_server:latest"  # DockerHub image
+  dockerfile = "Dockerfile"
 
-[env]                              # Non-secret environment variables
+[env]
   NODE_ENV = "production"
   SPARKY_FITNESS_SERVER_PORT = "3010"
   SPARKY_FITNESS_LOG_LEVEL = "INFO"
   TZ = "Etc/UTC"
 
 [http_service]
-  internal_port = 3010             # Port your app listens on
-  force_https = false              # Allow HTTP for internal traffic
-  auto_stop_machines = 'off'       # Never auto-stop
+  internal_port = 3010
+  force_https = false
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 1         # Always keep 1 running
+  min_machines_running = 1
   processes = ['app']
 
-[[http_service.checks]]            # Health check configuration
-  grace_period = "10s"             # Wait before first check
-  interval = "30s"                 # Check every 30s
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
   method = "GET"
   timeout = "5s"
-  path = "/health"                 # Endpoint to check
+  path = "/health"
 
-[[vm]]                             # Machine size
+[[vm]]
   memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
 ```
-
-**Docs**: https://fly.io/docs/reference/configuration/
 
 ### fly.toml (Frontend)
 
@@ -279,55 +287,88 @@ app = 'sparkyfitness'
 primary_region = 'iad'
 
 [build]
-  image = "codewithcj/sparkyfitness:latest"
+  dockerfile = "Dockerfile"
 
 [env]
-  # These configure nginx to proxy to the backend
   SPARKY_FITNESS_SERVER_HOST = "sparkyfitness-server.flycast"
-  SPARKY_FITNESS_SERVER_PORT = "80"    # Flycast uses port 80!
+  SPARKY_FITNESS_SERVER_PORT = "80"
 
 [http_service]
-  internal_port = 80               # nginx listens on 80
-  force_https = true               # Redirect users to HTTPS
-  auto_stop_machines = 'stop'      # OK to stop when idle
-  auto_start_machines = true       # Fly Proxy wakes it up
+  internal_port = 80
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
   min_machines_running = 0
 
 [[http_service.checks]]
-  path = "/"                       # Check the homepage
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/"
 
 [[vm]]
-  memory = '256mb'                 # Frontend needs less memory
+  memory = '256mb'
   cpu_kind = 'shared'
   cpus = 1
 ```
 
+### nginx.conf.template (Frontend)
+
+The frontend uses an nginx config template that substitutes environment variables at container startup. This lets us configure the backend hostname via `fly.toml` instead of hardcoding it.
+
+```nginx
+location /api/ {
+  proxy_pass http://$SPARKY_FITNESS_SERVER_HOST:$SPARKY_FITNESS_SERVER_PORT/;
+  proxy_set_header Host $host;
+  proxy_set_header X-Real-IP $remote_addr;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-Ssl on;
+}
+```
+
+The Dockerfile uses `envsubst` to replace the environment variables when the container starts:
+
+```dockerfile
+CMD envsubst '$SPARKY_FITNESS_SERVER_HOST $SPARKY_FITNESS_SERVER_PORT' < /etc/nginx/nginx.conf.template > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'
+```
+
+**Why specify which variables?** Nginx config uses `$uri`, `$host`, etc. as nginx variables. If we ran `envsubst` without specifying variables, it would try to replace those too and break the config.
+
 ---
 
-## Key Takeaways
+## Updating Your Deployment
 
-1. **Docker images are portable** - Build once, run anywhere
-2. **Fly.io handles the hard parts** - TLS, load balancing, health checks
-3. **Networking has layers** - Public vs private, proxy vs direct
-4. **Flycast is for internal load balancing** - Uses port 80, not your internal port
-5. **Secrets stay secret** - Use `flyctl secrets`, never commit them
-6. **Auto-stop saves money** - But only works for public traffic
+### Pull Latest from Upstream & Redeploy
 
----
+```bash
+# Get latest changes
+git fetch upstream
+git merge upstream/main
 
-## Useful Commands
+# Redeploy backend
+cd SparkyFitnessServer
+flyctl deploy --ha=false --local-only
+
+# Redeploy frontend
+cd ../SparkyFitnessFrontend
+flyctl deploy --ha=false --local-only
+```
+
+### Useful Commands
 
 ```bash
 # Check app status
 flyctl status --app sparkyfitness
 
-# View logs
+# View logs (streams live)
 flyctl logs --app sparkyfitness-server
 
-# SSH into a machine
+# SSH into a running machine
 flyctl ssh console --app sparkyfitness
 
-# List all apps
+# List all your apps
 flyctl apps list
 
 # Check secrets (names only, not values)
@@ -339,10 +380,23 @@ flyctl machine start <machine-id> --app sparkyfitness-server
 
 ---
 
+## Key Takeaways
+
+1. **Build from source for latest features** - Pre-built DockerHub images may be outdated
+2. **Fly.io handles the hard parts** - TLS termination, load balancing, health checks
+3. **Networking has layers** - Public (`.fly.dev`) vs private (`.internal`, `.flycast`)
+4. **Flycast uses port 80** - Not your internal port, because it routes through Fly Proxy
+5. **Secrets stay secret** - Use `flyctl secrets set`, never commit them to git
+6. **Auto-stop saves money** - But only works for public traffic, not internal
+7. **Use `--local-only` for reliable builds** - Avoids remote builder auth issues
+
+---
+
 ## Resources
 
 - [Fly.io Documentation](https://fly.io/docs/)
 - [Docker Getting Started](https://docs.docker.com/get-started/)
 - [SparkyFitness GitHub](https://github.com/codeWithCJ/SparkyFitness)
 - [Fly.io Networking](https://fly.io/docs/networking/)
+- [Flycast Documentation](https://fly.io/docs/networking/flycast/)
 - [fly.toml Reference](https://fly.io/docs/reference/configuration/)

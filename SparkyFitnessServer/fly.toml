@@ -2,7 +2,7 @@ app = 'sparkyfitness-server'
 primary_region = 'iad'
 
 [build]
-  image = "codewithcj/sparkyfitness_server:latest"
+  dockerfile = "Dockerfile"
 
 [env]
   NODE_ENV = "production"
