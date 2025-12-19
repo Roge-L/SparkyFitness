@@ -54,3 +54,8 @@ SparkyFitnessServer/temp_uploads/
 SparkyFitnessGarmin/mock_data/
 
 WIP/
+
+# Food database imports (large CSV files)
+sparkyfitness_foods*.csv
+sparkyfitness_foods_batches/
+MyFoodData*.csv
